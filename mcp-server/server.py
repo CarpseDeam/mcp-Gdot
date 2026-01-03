@@ -14,7 +14,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from analyzers import ProjectAnalyzer, GDScriptParser, TscnParser
+from analyzers import ProjectAnalyzer, GDScriptParser, TscnParser, AssetScanner
 
 # ============ Configuration ============
 
@@ -26,6 +26,7 @@ server = Server("godot-mcp")
 # Active project path (set via tool)
 _active_project: Optional[str] = None
 _analyzer: Optional[ProjectAnalyzer] = None
+_asset_scanner: Optional[AssetScanner] = None
 
 
 # ============ Godot HTTP Client ============
@@ -55,6 +56,14 @@ def get_analyzer() -> Optional[ProjectAnalyzer]:
     if _active_project and (not _analyzer or _analyzer.project_path != Path(_active_project)):
         _analyzer = ProjectAnalyzer(_active_project)
     return _analyzer
+
+
+def get_asset_scanner() -> Optional[AssetScanner]:
+    """Get the asset scanner for asset indexing."""
+    global _asset_scanner, _active_project
+    if _active_project and (not _asset_scanner or _asset_scanner.project_path != Path(_active_project)):
+        _asset_scanner = AssetScanner(_active_project)
+    return _asset_scanner
 
 
 # ============ Tool Definitions ============
@@ -666,6 +675,69 @@ async def list_tools() -> list[Tool]:
                 "required": ["pattern"]
             }
         ),
+        
+        # ========== ASSET SCANNING ==========
+        
+        Tool(
+            name="assets_scan",
+            description="Scan and index all assets in the project. Detects asset packs (TriForge, Synty, etc), categories (trees, ruins, etc), and generates tags. Results are cached.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "force": {"type": "boolean", "description": "Force rescan even if cache exists"},
+                    "exclude_addons": {"type": "boolean", "description": "Skip the addons folder"}
+                }
+            }
+        ),
+        Tool(
+            name="assets_search",
+            description="Search assets by query, type, pack, category, or tags",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search in path and tags"},
+                    "type": {"type": "string", "description": "Asset type: mesh, texture, scene, script, audio, etc"},
+                    "pack": {"type": "string", "description": "Asset pack: triforge, synty, quaternius, etc"},
+                    "category": {"type": "string", "description": "Category: trees, rocks, ruins, buildings, props, creatures, etc"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "All tags must match"},
+                    "limit": {"type": "integer", "description": "Max results (default 50)"}
+                }
+            }
+        ),
+        Tool(
+            name="assets_random",
+            description="Get random assets matching filters - great for scattering varied objects",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "description": "Asset type filter"},
+                    "pack": {"type": "string", "description": "Asset pack filter"},
+                    "category": {"type": "string", "description": "Category filter"},
+                    "count": {"type": "integer", "description": "Number of random assets (default 1)"}
+                }
+            }
+        ),
+        Tool(
+            name="assets_list_packs",
+            description="List all detected asset packs with counts",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="assets_list_categories",
+            description="List all asset categories with counts",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="assets_get",
+            description="Get detailed info for a single asset by path",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Resource path (res://...)"}
+                },
+                "required": ["path"]
+            }
+        ),
     ]
 
 
@@ -718,6 +790,42 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 elif name == "analyze_search_in_files":
                     file_types = arguments.get("file_types")
                     result = {"matches": analyzer.search_in_files(arguments["pattern"], file_types)}
+            except Exception as e:
+                result = {"error": str(e)}
+    
+    # === Asset Scanning Tools ===
+    elif name.startswith("assets_"):
+        scanner = get_asset_scanner()
+        if not scanner:
+            result = {"error": "No project set. Use godot_set_project first."}
+        else:
+            try:
+                if name == "assets_scan":
+                    force = arguments.get("force", False)
+                    exclude_addons = arguments.get("exclude_addons", False)
+                    result = scanner.scan(force=force, exclude_addons=exclude_addons)
+                elif name == "assets_search":
+                    result = {"assets": scanner.search(
+                        query=arguments.get("query"),
+                        asset_type=arguments.get("type"),
+                        pack=arguments.get("pack"),
+                        category=arguments.get("category"),
+                        tags=arguments.get("tags"),
+                        limit=arguments.get("limit", 50)
+                    )}
+                elif name == "assets_random":
+                    result = {"assets": scanner.get_random(
+                        asset_type=arguments.get("type"),
+                        pack=arguments.get("pack"),
+                        category=arguments.get("category"),
+                        count=arguments.get("count", 1)
+                    )}
+                elif name == "assets_list_packs":
+                    result = {"packs": scanner.list_packs()}
+                elif name == "assets_list_categories":
+                    result = {"categories": scanner.list_categories()}
+                elif name == "assets_get":
+                    result = scanner.get_asset(arguments["path"]) or {"error": "Asset not found"}
             except Exception as e:
                 result = {"error": str(e)}
     

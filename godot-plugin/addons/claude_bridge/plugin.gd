@@ -1109,25 +1109,25 @@ func _search_nodes(data: Dictionary) -> Dictionary:
 
 
 func _search_recursive(node: Node, criteria: Dictionary, results: Array) -> void:
-	var match = true
+	var is_match = true
 	
 	if criteria.has("type"):
 		if not criteria["type"] in node.get_class():
-			match = false
+			is_match = false
 	
 	if criteria.has("name_contains"):
 		if not criteria["name_contains"].to_lower() in node.name.to_lower():
-			match = false
+			is_match = false
 	
 	if criteria.has("group"):
 		if not node.is_in_group(criteria["group"]):
-			match = false
+			is_match = false
 	
 	if criteria.has("has_property"):
 		if not node.get(criteria["has_property"]):
-			match = false
+			is_match = false
 	
-	if match:
+	if is_match:
 		var info = {
 			"name": node.name,
 			"type": node.get_class(),
