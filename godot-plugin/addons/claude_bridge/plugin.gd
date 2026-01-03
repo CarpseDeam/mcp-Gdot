@@ -5,10 +5,13 @@ extends EditorPlugin
 
 const PORT = 6550
 const MAX_CLIENTS = 10
+const LOG_BUFFER_SIZE = 100
 
 var _server: TCPServer
 var _clients: Array[StreamPeerTCP] = []
 var _timer: Timer
+var _log_buffer: Array[Dictionary] = []
+var _last_execution_output: Dictionary = {}
 
 # ============ Plugin Lifecycle ============
 
@@ -162,6 +165,11 @@ func _route_request(path: String, method: String, data: Dictionary) -> Dictionar
 		# === Debug / Runtime ===
 		"debug/run_scene": return _run_current_scene()
 		"debug/stop": return _stop_running()
+		"debug/logs": return _get_debug_logs(data)
+		"debug/clear_logs": return _clear_debug_logs()
+		
+		# === Vision ===
+		"viewport/screenshot": return _get_viewport_screenshot(data)
 		
 		# === Advanced ===
 		"execute": return _execute_script(data)
@@ -186,7 +194,8 @@ func _list_endpoints() -> Array:
 		"batch/delete_by_group", "batch/replace_mesh",
 		"search/nodes", "search/by_type", "search/by_group", "search/by_name",
 		"project/scenes", "project/scripts", "project/resources",
-		"debug/run_scene", "debug/stop",
+		"debug/run_scene", "debug/stop", "debug/logs", "debug/clear_logs",
+		"viewport/screenshot",
 		"execute", "execute/on_selected"
 	]
 
@@ -1256,6 +1265,92 @@ func _stop_running() -> Dictionary:
 	return {"success": true}
 
 
+func _get_debug_logs(data: Dictionary) -> Dictionary:
+	var count = data.get("count", LOG_BUFFER_SIZE)
+	var level_filter = data.get("level", null)
+	
+	var logs = _log_buffer.slice(-count) if count < _log_buffer.size() else _log_buffer.duplicate()
+	
+	if level_filter:
+		logs = logs.filter(func(entry): return entry.get("level") == level_filter)
+	
+	return {
+		"logs": logs,
+		"count": logs.size(),
+		"total_buffered": _log_buffer.size(),
+		"last_execution": _last_execution_output
+	}
+
+
+func _clear_debug_logs() -> Dictionary:
+	_log_buffer.clear()
+	_last_execution_output = {}
+	return {"success": true}
+
+
+func _log_message(message: String, level: String = "info") -> void:
+	var entry = {
+		"timestamp": Time.get_datetime_string_from_system(),
+		"level": level,
+		"message": message
+	}
+	_log_buffer.append(entry)
+	if _log_buffer.size() > LOG_BUFFER_SIZE:
+		_log_buffer.pop_front()
+
+
+# ============ Vision / Viewport ============
+
+func _get_viewport_screenshot(data: Dictionary) -> Dictionary:
+	var width = data.get("width", 0)
+	var height = data.get("height", 0)
+	var viewport_type = data.get("viewport", "3d")
+	
+	var viewport: SubViewport = null
+	var image: Image = null
+	
+	if viewport_type == "3d":
+		var editor_viewport = EditorInterface.get_editor_viewport_3d(0)
+		if not editor_viewport:
+			return {"error": "Could not access 3D viewport"}
+		viewport = editor_viewport.get_viewport()
+	elif viewport_type == "2d":
+		var editor_viewport = EditorInterface.get_editor_viewport_2d()
+		if not editor_viewport:
+			return {"error": "Could not access 2D viewport"}
+		viewport = editor_viewport.get_viewport()
+	else:
+		return {"error": "Invalid viewport type. Use '3d' or '2d'"}
+	
+	if not viewport:
+		return {"error": "Viewport not available"}
+	
+	image = viewport.get_texture().get_image()
+	if not image:
+		return {"error": "Could not capture viewport image"}
+	
+	if width > 0 and height > 0:
+		image.resize(width, height, Image.INTERPOLATE_LANCZOS)
+	elif width > 0 or height > 0:
+		var aspect = float(image.get_width()) / float(image.get_height())
+		if width > 0:
+			height = int(width / aspect)
+		else:
+			width = int(height * aspect)
+		image.resize(width, height, Image.INTERPOLATE_LANCZOS)
+	
+	var png_buffer = image.save_png_to_buffer()
+	var base64_data = Marshalls.raw_to_base64(png_buffer)
+	
+	return {
+		"success": true,
+		"image_base64": base64_data,
+		"width": image.get_width(),
+		"height": image.get_height(),
+		"format": "png"
+	}
+
+
 # ============ Script Execution ============
 
 func _execute_script(data: Dictionary) -> Dictionary:
@@ -1269,6 +1364,13 @@ extends RefCounted
 var editor: EditorInterface
 var scene_root: Node
 var selection: EditorSelection
+var _output: Array = []
+
+func _print(msg) -> void:
+	_output.append(str(msg))
+
+func get_output() -> Array:
+	return _output
 
 func execute():
 %s
@@ -1276,6 +1378,9 @@ func execute():
 	
 	var err = script.reload()
 	if err != OK:
+		var error_msg = "Compilation failed with error code: %d" % err
+		_log_message(error_msg, "error")
+		_last_execution_output = {"error": error_msg, "code": data["code"]}
 		return {"error": "Compilation failed", "code": err}
 	
 	var instance = script.new()
@@ -1283,11 +1388,27 @@ func execute():
 	instance.scene_root = EditorInterface.get_edited_scene_root()
 	instance.selection = EditorInterface.get_selection()
 	
-	var result = instance.execute()
+	var result = null
+	var execution_error = null
 	
+	result = instance.execute()
+	
+	var output = instance.get_output()
+	_last_execution_output = {
+		"code": data["code"],
+		"result": _serialize_value(result) if result != null else null,
+		"output": output,
+		"timestamp": Time.get_datetime_string_from_system()
+	}
+	
+	if output.size() > 0:
+		for line in output:
+			_log_message(line, "output")
+	
+	var response = {"success": true, "output": output}
 	if result != null:
-		return {"result": _serialize_value(result)}
-	return {"success": true}
+		response["result"] = _serialize_value(result)
+	return response
 
 
 func _execute_on_selected(data: Dictionary) -> Dictionary:

@@ -12,13 +12,14 @@ from pathlib import Path
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, ImageContent
 
 from analyzers import ProjectAnalyzer, GDScriptParser, TscnParser, AssetScanner
 
 # ============ Configuration ============
 
 GODOT_BRIDGE_URL = "http://127.0.0.1:6550"
+GODOT_RUNTIME_URL = "http://127.0.0.1:6551"
 DEFAULT_TIMEOUT = 30.0
 
 server = Server("godot-mcp")
@@ -45,6 +46,25 @@ async def call_godot(endpoint: str, data: dict = None) -> dict:
             return {
                 "error": "Cannot connect to Godot editor",
                 "hint": "Make sure Godot is running with the Claude Bridge plugin enabled"
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+
+async def call_runtime(endpoint: str, data: dict = None) -> dict:
+    """Make HTTP request to running Godot game."""
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            url = f"{GODOT_RUNTIME_URL}/{endpoint}"
+            if data:
+                response = await client.post(url, json=data)
+            else:
+                response = await client.get(url)
+            return response.json()
+        except httpx.ConnectError:
+            return {
+                "error": "Cannot connect to running game",
+                "hint": "Make sure the game is running with ClaudeRuntimeDebug autoload enabled"
             }
         except Exception as e:
             return {"error": str(e)}
@@ -541,6 +561,69 @@ async def list_tools() -> list[Tool]:
             description="Stop the running game",
             inputSchema={"type": "object", "properties": {}}
         ),
+        Tool(
+            name="godot_get_debug_logs",
+            description="Get debug logs from the editor including script execution output and errors",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "count": {"type": "integer", "description": "Max number of log entries to return (default 100)"},
+                    "level": {"type": "string", "description": "Filter by level: info, warning, error, output"}
+                }
+            }
+        ),
+        Tool(
+            name="godot_clear_debug_logs",
+            description="Clear the debug log buffer",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        
+        # === Vision ===
+        Tool(
+            name="godot_get_viewport_screenshot",
+            description="Capture a screenshot of the editor viewport. Returns base64 encoded PNG image that Claude can see and analyze.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "viewport": {"type": "string", "description": "Which viewport: '3d' or '2d' (default: '3d')"},
+                    "width": {"type": "integer", "description": "Resize to width (0 = original size)"},
+                    "height": {"type": "integer", "description": "Resize to height (0 = original size)"}
+                }
+            }
+        ),
+        
+        # === Runtime (Running Game) ===
+        Tool(
+            name="godot_game_ping",
+            description="Check if the running game is responding. Use this before taking game screenshots.",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="godot_game_screenshot",
+            description="Capture a screenshot of the RUNNING GAME (not the editor). Game must be running with ClaudeRuntimeDebug autoload. Returns base64 PNG image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "width": {"type": "integer", "description": "Resize to width (0 = original size)"},
+                    "height": {"type": "integer", "description": "Resize to height (0 = original size)"}
+                }
+            }
+        ),
+        Tool(
+            name="godot_game_info",
+            description="Get info about the running game: current scene, FPS, viewport size.",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="godot_wait",
+            description="Wait for a specified number of seconds. Useful after godot_run_scene to let the game boot before taking a screenshot.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "seconds": {"type": "number", "description": "Seconds to wait (default: 2.0)"}
+                }
+            }
+        ),
         
         # === Script Execution ===
         Tool(
@@ -744,7 +827,7 @@ async def list_tools() -> list[Tool]:
 # ============ Tool Handler ============
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
     global _active_project
     
     result = {}
@@ -829,6 +912,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             except Exception as e:
                 result = {"error": str(e)}
     
+    # === Runtime Tools (Running Game) ===
+    elif name.startswith("godot_game_") or name == "godot_wait":
+        if name == "godot_game_ping":
+            result = await call_runtime("ping")
+        elif name == "godot_game_screenshot":
+            result = await call_runtime("screenshot", arguments if arguments else None)
+        elif name == "godot_game_info":
+            result = await call_runtime("info")
+        elif name == "godot_wait":
+            seconds = arguments.get("seconds", 2.0) if arguments else 2.0
+            await asyncio.sleep(seconds)
+            result = {"success": True, "waited": seconds}
+    
     # === Live Godot Tools ===
     else:
         # Map tool names to endpoints
@@ -871,6 +967,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             "godot_list_scripts": "project/scripts",
             "godot_run_scene": "debug/run_scene",
             "godot_stop_running": "debug/stop",
+            "godot_get_debug_logs": "debug/logs",
+            "godot_clear_debug_logs": "debug/clear_logs",
+            "godot_get_viewport_screenshot": "viewport/screenshot",
             "godot_execute": "execute",
             "godot_execute_on_selected": "execute/on_selected",
         }
@@ -880,6 +979,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             result = await call_godot(endpoint, arguments if arguments else None)
         else:
             result = {"error": f"Unknown tool: {name}"}
+    
+    # Special handling for screenshots - return as image
+    if name in ("godot_get_viewport_screenshot", "godot_game_screenshot") and "image_base64" in result:
+        image_data = result.pop("image_base64")
+        return [
+            ImageContent(
+                type="image",
+                data=image_data,
+                mimeType="image/png"
+            ),
+            TextContent(
+                type="text",
+                text=json.dumps({"width": result.get("width"), "height": result.get("height"), "success": True}, indent=2)
+            )
+        ]
     
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
